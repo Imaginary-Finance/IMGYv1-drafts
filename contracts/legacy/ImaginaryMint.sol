@@ -1,4 +1,4 @@
-// contracts/imaginaryMint.sol
+// contracts/imaginaryMint.sol - NOT PRODUCTION
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
@@ -16,34 +16,26 @@ import "./lib/interfaces/IImaginaryToken.sol";
 
 //import "hardhat/console.sol";
 
-contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault {
+contract ImaginaryMint is Ownable, Pausable, TokenOracle, Vault {
 	using SafeMath for uint256;
-    using SafeERC20 for IERC20;
+	using SafeERC20 for IERC20;
 
 	address public asset;				//underlying asset
 	uint256 public oracleDecimalOffset;	//price decimal offset
-	uint256 public collateralDecimalOffset;
 
 	address public imaginaryOracle;		//debt price
 	uint256 public fallbackTokenPeg;	//peg price
 	IImaginaryToken public iAsset;		//imaginary token
 
-	address public author;				//authorized value pool
-	uint256 public claimRatio;			//liquidation claim
-
-	uint256 public debtRaiseRatio;  	//
-	uint256 public minimumMintRatio;	//cannot mint morth than value
-	uint256 public maximumMintRatio;	//negative interest loans (◕‿◕)
+	uint256 public minimumMintRatio;	//
+	uint256 public maximumMintRatio;	//(◕‿◕)
 
 	uint256 public treasuryVaultID;		//0
-	uint256 public operationFee;		//0.5%
+	uint256 public liquidationFee;
+	uint256 public operationFee;
 
-									//interest bearing assets
-	mapping(uint256 => bool) public applyMaximumRatio;
-	
 	mapping(uint256 => uint256) public mintCollateral;
 	mapping(uint256 => uint256) public mintAmount;
-	mapping(uint256 => address) public mintOwner;
 
 	event AssetLock(
 		uint256 vaultID,
@@ -64,20 +56,10 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
 		uint256 fee
 	);
 
-	event VaultCreated(
-		uint256 vaultID,
-		address owner
-	);
-	event VaultClosed(
-		uint256 vaultID,
-		address owner
-	);
-
 	event VaultLiquidated(
 		uint256 vaultID,
 		uint256 resolved,
 		uint256 claimed,
-
 		uint256 feeVault,
 		uint256 fee
 	);
@@ -86,61 +68,54 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
 		string memory name,
 		string memory symbol,
 
-		//address owner,
-
 		address _asset,
 		address _assetOracle,
 		address _iAsset,
 		address _author,
-		address _treasurer,
 
-		uint256 raisingRatio,
 		uint256 mintRatio
 	) Vault(name, symbol) {
 		asset = _asset;
-
 		iAsset = IImaginaryToken(_iAsset);
-		author = _author;
 
 		oracleDecimalOffset = 4;
-		collateralDecimalOffset = 8;
 
-		debtRaiseRatio		= raisingRatio;
 		minimumMintRatio	= mintRatio;
-		fallbackTokenPeg	= 100000000;
-		//if set, will trigger healthy liquidations
 		maximumMintRatio	= 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
+		fallbackTokenPeg	= 100000000;
+		liquidationFee		=	 10;	//10%
 		operationFee 		=    50;	//0.5%
-		claimRatio			= 15000;	//150%
 
 		treasuryVaultID 				= 0;
 		mintCollateral[treasuryVaultID] = 0;
 		mintAmount[treasuryVaultID] 	= 0;
 
-		transferOwnership(_treasurer);
-		
-		_setAssetOracle(_assetOracle, fallbackTokenPeg);
+		transferOwnership(_author);
+
+		_setAssetOracle(_assetOracle, 0);
 	}
 
 	modifier onlyVaultOwner(uint256 vaultID) {
-        require(_exists(vaultID), "Does not exist");
-        require(ownerOf(vaultID) == msg.sender, "");
+        require(treasuryVaultID == vaultID || _exists(vaultID), "Does not exist");
+        require((
+			ownerOf(vaultID) == msg.sender ||
+			(owner() == msg.sender && treasuryVaultID == vaultID)
+		), "");
         _;
     }
 
-	function createVault() external {
+	function createVault() external returns(uint256) {
 		address owner = msg.sender;
 		uint256 vaultID = _createVault(owner);
 
-		mintOwner[vaultID] = owner;
 		mintCollateral[vaultID] = 0;
 		mintAmount[vaultID] = 0;
 
-		emit VaultCreated(vaultID, owner);
+		return(vaultID);
 	}
 
 	function lockAsset(uint256 vaultID, uint256 amount) external whenNotPaused {
-		require(IERC20(asset).allowance(msg.sender, address(this)) >= amount, "Mint: I cannot acces those.");
+		//will revert if cannot access tokens
 
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
 
@@ -152,13 +127,13 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
         emit AssetLock(vaultID, amount);
     }
 
-	function unlockAsset(uint256 vaultID, uint256 amount) external onlyVaultOwner(vaultID) nonReentrant {
-        require(mintCollateral[vaultID] >= amount, "Mint: Vault does not contain that amount of assets.");
+	function unlockAsset(uint256 vaultID, uint256 amount) external onlyVaultOwner(vaultID) {
+        require(mintCollateral[vaultID] >= amount, "Vault does not have this.");
 
         uint256 newCollateral = mintCollateral[vaultID].sub(amount);
 
         if(mintAmount[vaultID] != 0) {
-            require(isNutritional(newCollateral, mintAmount[vaultID]), "Mint: This would put vault at risk of liquidation.");
+            require(isNutritional(newCollateral, mintAmount[vaultID]), "This would put vault at risk.");
         }
 
         mintCollateral[vaultID] = newCollateral;
@@ -172,7 +147,7 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
 			vaultID != treasuryVaultID &&
 			mintCollateral[vaultID] > 0 &&
 			amount > 0
-		), "Mint: Cannot mint with these arguments.");
+		), "Vault cannot mint.");
 
         uint256 newAmount = mintAmount[vaultID].add(amount);
 		uint256 fee = feeInCollateral(amount);
@@ -180,13 +155,12 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
 		uint256 newCollateral = mintCollateral[vaultID].sub(fee);
 		uint256 treasuryCollateral = mintCollateral[treasuryVaultID].add(fee);
 
-        require(isNutritional(mintCollateral[vaultID], newAmount), "Mint: Cannot mint against these assets.");
-		
-		bool hasFunds = _canLend(amount);
-        require(hasFunds, "Mint: Can not mint above the debt ceiling.");
+        require(isNutritional(newCollateral, newAmount), "Cannot mint.");
+
+        require(_canLend(amount), "Not enough mintable.");
 
 		assert(
-			(newAmount > mintAmount[vaultID]) && 
+			(newAmount > mintAmount[vaultID]) &&
 			(newCollateral < mintCollateral[vaultID]) &&
 			(treasuryCollateral > mintCollateral[treasuryVaultID])
 		);
@@ -201,11 +175,8 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
     }
 
     function returnToken(uint256 vaultID, uint256 amount) external onlyVaultOwner(vaultID) {
-        require((
-			IERC20(address(iAsset)).balanceOf(msg.sender) >= amount &&
-			IERC20(address(iAsset)).allowance(msg.sender, address(this)) >= amount
-		), "Mint: Cannot return tokens.");
-        require(mintAmount[vaultID] >= amount, "Mint: Vault does not need to return this amount.");
+		//will revert if cannot access tokens
+        require(mintAmount[vaultID] >= amount, "Vault does not need to.");
 
 		uint256 fee = feeInCollateral(amount);
 		uint256 newAmount = mintAmount[vaultID].sub(amount);
@@ -214,7 +185,7 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
 		uint256 treasuryCollateral = mintCollateral[treasuryVaultID].add(fee);
 
 		assert(
-			(newAmount < mintAmount[vaultID]) && 
+			(newAmount < mintAmount[vaultID]) &&
 			(newCollateral < mintCollateral[vaultID]) &&
 			(treasuryCollateral > mintCollateral[treasuryVaultID])
 		);
@@ -229,80 +200,64 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
         emit Returned(vaultID, amount, fee);
     }
 
-
-
-	//TODO: LIQUIDATIONS
-	function liquidate(uint256 vaultID, uint256 lqdrVaultID) external nonReentrant {
+	function liquidate(uint256 vaultID, uint256 lqdrVaultID) external {
 		require((
-			_exists(vaultID) &&
-			mintAmount[vaultID] > 0 &&
-			isVaultUnhealthy(vaultID)
-		), "Mint: Liquidation not allowed on this vault.");
-		address lqdr = msg.sender;
-        require((
-			(author == address(0) && (
+			(
+				_exists(vaultID) &&
+				!isNutritional(mintCollateral[vaultID], mintAmount[vaultID])
+			) && (
 				lqdrVaultID == treasuryVaultID ||
-				lqdr == ownerOf(lqdrVaultID)
-			)) ||
-			author == lqdr
-		), "Mint: Not authorized to liquidate.");
+				msg.sender == ownerOf(lqdrVaultID)
+			)
+		), "Liquidation not allowed.");
 
-		(uint256 va, uint256 vi) = scale(
+		(uint256 va, ) = scale(
 			mintCollateral[vaultID],
 			mintAmount[vaultID]
 		);
+		// calculate
+		uint256 fee = va.mul(liquidationFee).div(100);
+		uint256 feeCollateral = fee.div(assetPrice());
+		//liquidator reward - 25% of claimed
+		uint256 reward = feeCollateral.mul(256).div(1024);
+		uint256 feeMinusReward = feeCollateral.sub(reward);
 
-		uint256 maxValue = va.mul(100).div(minimumMintRatio);
-		uint256 maxAmount = maxValue.div(debtPrice());
+		uint256 valueAfterFee = va.sub(fee);
+
+		uint256 maxBorrow = valueAfterFee.mul(100).div(minimumMintRatio.add(1)).div(debtPrice()); //wanna set max borrow to just above min
+		uint256 debtOffset = mintAmount[vaultID].sub(maxBorrow); //calculate debt offset
+
+		uint256 newCollateral = mintCollateral[vaultID].sub(feeCollateral); //.add(feeColat)
+		uint256 treasuryCollateral = mintCollateral[treasuryVaultID].add(feeMinusReward);
 		
-		//Amount of unhealthy issued assets
-		uint256 diff = mintAmount[vaultID].sub(maxAmount);
-
+		//repay
 		require((
-			IERC20(address(iAsset)).balanceOf(lqdr) >= diff &&
-			IERC20(address(iAsset)).allowance(lqdr, address(this)) >= diff
-		), "Mint: Cannot return tokens.");
+			IERC20(address(iAsset)).balanceOf(msg.sender) >= debtOffset &&
+			IERC20(address(iAsset)).allowance(msg.sender, address(this)) >= debtOffset
+		), "Cannot return tokens.");
+		
+		IERC20(address(iAsset)).safeTransferFrom(msg.sender, address(this), debtOffset);
+		mintAmount[vaultID] = mintAmount[vaultID].sub(debtOffset);
 
-		uint256 claimedCollateral = ( //150% of the debt removed
-			diff.mul(claimRatio).mul(debtPrice())
-		).div(
-			assetPrice().mul(10**oracleDecimalOffset)
-		);
-
-		uint256 newCollateral = mintCollateral[vaultID].sub(claimedCollateral);
-		uint256 treasuryCollateral = mintCollateral[treasuryVaultID].add(claimedCollateral);
-		uint256 lqdrReward = 0;
-
-		//give spoils to lqdr if it's not treasury
-		if(lqdrVaultID != treasuryVaultID) {
-			lqdrReward = feeInCollateral(diff).mul(100); //0.5% to 50%
-			treasuryCollateral = mintCollateral[treasuryVaultID].add(claimedCollateral.sub(lqdrReward));
+		//move colat
+		if(lqdrVaultID != treasuryVaultID && reward > 0) {
+        	mintCollateral[lqdrVaultID] = mintCollateral[lqdrVaultID].add(reward);
+		} else {
+			treasuryCollateral = treasuryCollateral.add(reward);
 		}
-
-		assert(
-			(newCollateral < mintCollateral[vaultID]) &&
-			(treasuryCollateral > mintCollateral[treasuryVaultID])
-		);
-
-		IERC20(address(iAsset)).safeTransferFrom(lqdr, address(this), diff);
-
 		mintCollateral[vaultID] = newCollateral;
-		mintAmount[vaultID] = maxAmount;
 		mintCollateral[treasuryVaultID] = treasuryCollateral;
-		if(lqdrVaultID != treasuryVaultID) {
-			mintCollateral[lqdrVaultID] = mintCollateral[lqdrVaultID].add(lqdrReward);
-		}
 
-		emit VaultLiquidated(vaultID, diff, claimedCollateral, lqdrVaultID, lqdrReward);
+		emit VaultLiquidated(vaultID, debtOffset, feeCollateral, lqdrVaultID, reward);
 	}
 
 
 	//MINT CONTROL
-	function pauseMint() external onlyOwner whenNotPaused {
+	function pauseMint() external onlyOwner {
 		_pause();
 	}
 
-	function unpauseMint() external onlyOwner whenPaused {
+	function unpauseMint() external onlyOwner {
 		_unpause();
 	}
 
@@ -332,15 +287,11 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
 
 	function debtPrice() public view returns(uint256) {
 		uint256 truePrice = fallbackTokenPeg;
-        if(imaginaryOracle != address(0)) {
+		if(imaginaryOracle != address(0)) {
 			(,int256 price,,,) = Oracle(imaginaryOracle).latestRoundData();
 			truePrice = uint256(price);
 		}
 		return( truePrice /* debt peg or iAsset oracle */);
-	}
-
-	function mintCeiling() public returns(uint256) {
-		return( iAsset.mintedSupply(address(this)) /* TOTAL iAssets that this mint has minted. */);
 	}
 
 	function mintBalance() public view returns(uint256) {
@@ -354,12 +305,6 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
 		return(getHealth(a, b) >= minimumMintRatio);
 	}
 
-	function isVaultUnhealthy(
-		uint256 vaultID
-	) public view returns(bool) {
-		return(getHealth(mintCollateral[vaultID], mintAmount[vaultID]) >= minimumMintRatio);
-	}
-
 	function feeInCollateral(uint256 amt) internal view returns(uint256) {
 		uint256 fee = (
 			amt.mul(operationFee).mul(debtPrice())
@@ -367,40 +312,22 @@ contract ImaginaryMint is Ownable, Pausable, ReentrancyGuard, TokenOracle, Vault
 			assetPrice().mul(10**oracleDecimalOffset)
 		);
 		//console.log("fee [0.5%] is [%s] when applied to [%s]", fee, amt);
-		if(fee > 0) {
-			return(fee);
-		}
-		return(0);
-	}
-
-	function openTreasury() external onlyOwner {
-		require(mintCollateral[treasuryVaultID] > 0, "Mint: Cannot transfer.");
-		uint256 amount = mintCollateral[treasuryVaultID];
-
-        IERC20(asset).safeTransferFrom(address(this), owner(), amount);
-        mintCollateral[treasuryVaultID] = 0;
-
-        emit AssetUnlock(treasuryVaultID, amount);
+		return( (fee > 0) ? fee : 0 );
 	}
 
 	function _canLend(uint256 amount) internal returns(bool) {
-		//TODO: CRITERIA FOR MINTING
 		bool hasEnough = (mintBalance() >= amount);
-		if(!hasEnough && !paused()) {
+		if(!hasEnough) {
 			iAsset.requestMint(address(this));
-			return((mintBalance() >= amount));
-		} else if (hasEnough) {
-			return(true);
+			return(mintBalance() >= amount);
 		} else {
-			return(false);
+			return(hasEnough);
 		}
 	}
 
 	function _returnToMint() internal {
-		if(!paused()) {
-			IERC20(address(iAsset)).approve(address(iAsset), 0);
-			IERC20(address(iAsset)).approve(address(iAsset), mintBalance());
-			iAsset.requestBurn(address(this));
-		}
+		IERC20(address(iAsset)).approve(address(iAsset), 0);
+		IERC20(address(iAsset)).approve(address(iAsset), mintBalance());
+		iAsset.requestBurn(address(this));
 	}
 }
